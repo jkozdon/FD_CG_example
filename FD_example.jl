@@ -12,7 +12,7 @@ else
   const ArrayTypes = (Array, )
 end
 
-# Based on CG algorithm from 
+# Based on CG algorithm from
 """
     cg_iteration!(x, d, g, w, y_Ax!, gTg)
 
@@ -49,6 +49,10 @@ function cg!(x, b, y_Ax!, tol, maxiteration=length(x))
   g = similar(x)
   d = similar(x)
   w = similar(x)
+
+  g .= 0
+  d .= 0
+  w .= 0
 
   y_Ax!(g, x)
   g .-= b
@@ -93,3 +97,95 @@ let
   # check that the solution converged
   @assert norm(A*x - b) < tol
 end
+
+"""
+    k_fd!(Au, u, ::Val{N}) where N
+
+Computes the 3D, 2nd order central difference stencil with strong enforcement of
+boundary data which is already set of u
+"""
+function k_fd!(Au, u, ::Val{N}, ::Val{Δ}) where {N, Δ}
+  # Loop over interion and apply update
+  # threads shifted by one on the GPU to match the bounds
+  @inbounds @loop for k in (2:N[3]; threadIdx().z+1)
+    @loop for j in (2:N[2]; threadIdx().y+1)
+      @loop for i in (2:N[1]; threadIdx().x+1)
+        # Compute the centeral FD stencil assuming h = 1 and that the Dirchlet
+        # boundary data is already set in u
+        tmp = -zero(eltype(Au))
+        tmp += (u[i-1, j, k] - 2u[i, j, k] + u[i+1, j, k]) / Δ[1]^2
+        tmp += (u[i, j-1, k] - 2u[i, j, k] + u[i, j+1, k]) / Δ[2]^2
+        tmp += (u[i, j, k-1] - 2u[i, j, k] + u[i, j, k+1]) / Δ[3]^2
+        Au[i, j, k] = tmp
+      end
+    end
+  end
+end
+
+function fd!(Au, u, Δ)
+  device = typeof(u) <: Array ? CPU() : CUDA()
+  N = size(Au) .- 1
+
+  threads = (16, 16, 4)
+  blocks = div.((N .- 1) .+ threads .- 1, threads)
+  @launch(device, threads=threads, blocks=blocks, k_fd!(Au, u, Val(N), Val(Δ)))
+end
+
+# Test with a simple matrix
+let
+  tol = 1e-6
+
+  # number of levels determined by size of error array
+  err = zeros(5)
+  for k = 1:length(err)
+    # problem size
+    N = (1, 2, 3) .* (2, 2, 2).^k
+
+    # grid spacing
+    Δ = 1 ./ N
+
+    # create the mesh
+    x = kron(ones(N[3]+1), ones(N[2]+1), range(0; stop = 1, length = N[1]+1))
+    y = kron(ones(N[3]+1), range(0; stop = 1, length = N[2]+1), ones(N[1]+1))
+    z = kron(range(0; stop = 1, length = N[3]+1), ones(N[2]+1), ones(N[1]+1))
+
+    x, y, z = reshape.((x, y, z), N[1]+1, N[2]+1, N[3]+1)
+
+    # Exact solution
+    uex = exp.(x) .* exp.(y) .* cos.(√2z)
+
+    # Exact boundary data
+    u = copy(uex)
+    u[2:end-1, 2:end-1, 2:end-1] .= 0
+
+    # compute the influence of the boundary conditions
+    b = zeros(size(uex))
+    fd!(b, u, Δ)
+    @. b = -b
+
+    # Set the initial condition
+    u .= 0
+
+    # Compute conjugate gradient algorithm
+    cg!(u, b, (y, x)->fd!(y, x, Δ), tol)
+
+    # fill in the boundary data
+    u[  1,   :,   :] = uex[  1,   :,   :]
+    u[end,   :,   :] = uex[end,   :,   :]
+    u[  :,   1,   :] = uex[  :,   1,   :]
+    u[  :, end,   :] = uex[  :, end,   :]
+    u[  :,   :,   1] = uex[  :,   :,   1]
+    u[  :,   :, end] = uex[  :,   :, end]
+
+    # check the error
+    err[k] = √prod(Δ) * norm(u - uex)
+  end
+
+  # Since we use grid doubling this estimates the rate
+  rate = log2.(err[1:end-1]./ err[2:end])
+
+  @show err
+  @show rate
+end
+
+nothing
