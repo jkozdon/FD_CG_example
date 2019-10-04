@@ -1,16 +1,7 @@
 using LinearAlgebra
 using GPUifyLoops
-
-using Pkg
-@static if haskey(Pkg.installed(), "CuArrays")
-  using CUDAdrv
-  using CUDAnative
-  using CuArrays
-  CuArrays.allowscalar(false)
-  const ArrayTypes = (CuArray, )
-else
-  const ArrayTypes = (Array, )
-end
+using Logging
+using Printf
 
 # Based on CG algorithm from
 """
@@ -60,15 +51,20 @@ function cg!(x, b, y_Ax!, tol, maxiteration=length(x))
 
   gTg = dot(g, g)
 
+  start_time = time()
   for k = 1:maxiteration
     if gTg < tol^2
-      return gTg, k
+      end_time = time()
+      total_time = end_time - start_time
+      return gTg, k, total_time
     end
 
     gTg = cg_iteration!(x, d, g, w, y_Ax!, gTg)
   end
 
-  return gTg, maxiteration+1
+  end_time = time()
+  total_time = end_time - start_time
+  return gTg, maxiteration+1, total_time
 end
 
 # Test with a simple matrix
@@ -98,6 +94,17 @@ let
   @assert norm(A*x - b) < tol
 end
 
+using Pkg
+@static if haskey(Pkg.installed(), "CuArrays")
+  using CUDAdrv
+  using CUDAnative
+  using CuArrays
+  CuArrays.allowscalar(false)
+  const ArrayType = CuArray
+else
+  const ArrayType = Array
+end
+
 """
     k_fd!(Au, u, ::Val{N}) where N
 
@@ -107,9 +114,31 @@ boundary data which is already set of u
 function k_fd!(Au, u, ::Val{N}, ::Val{Δ}) where {N, Δ}
   # Loop over interion and apply update
   # threads shifted by one on the GPU to match the bounds
-  @inbounds @loop for k in (2:N[3]; threadIdx().z+1)
-    @loop for j in (2:N[2]; threadIdx().y+1)
-      @loop for i in (2:N[1]; threadIdx().x+1)
+
+  # The @loop macro translates the for loop to different code on the CPU and
+  # GPU.
+  #
+  # On the CPU this translates to:
+  #
+  #    for k = 2:N[3]
+  #      {rest of the code}
+  #     end
+  #
+  # On the GPU this translates to:
+  #
+  #    k = (blockIdx().z-1) * blockDim().z + threadIdx().z+1
+  #    if k in 2:N[3]
+  #      {rest of the code}
+  #     end
+  #
+  # Note that the +1 at the end is for shifting the threads to start at 2 and
+  # not 1
+  @inbounds @loop for k in (2:N[3];
+                            (blockIdx().z-1) * blockDim().z + threadIdx().z+1)
+    @loop for j in (2:N[2];
+                    (blockIdx().y-1) * blockDim().y + threadIdx().y+1)
+      @loop for i in (2:N[1];
+                      (blockIdx().x-1) * blockDim().x + threadIdx().x+1)
         # Compute the centeral FD stencil assuming h = 1 and that the Dirchlet
         # boundary data is already set in u
         tmp = -zero(eltype(Au))
@@ -126,7 +155,7 @@ function fd!(Au, u, Δ)
   device = typeof(u) <: Array ? CPU() : CUDA()
   N = size(Au) .- 1
 
-  threads = (16, 16, 4)
+  threads = (32, 16, 1)
   blocks = div.((N .- 1) .+ threads .- 1, threads)
   @launch(device, threads=threads, blocks=blocks, k_fd!(Au, u, Val(N), Val(Δ)))
 end
@@ -136,7 +165,8 @@ let
   tol = 1e-6
 
   # number of levels determined by size of error array
-  err = zeros(5)
+  err = zeros(8)
+  rate = zeros(length(err)-1)
   for k = 1:length(err)
     # problem size
     N = (1, 2, 3) .* (2, 2, 2).^k
@@ -166,8 +196,15 @@ let
     # Set the initial condition
     u .= 0
 
+    # Copy the arrays to the device
+    d_u = ArrayType(u)
+    d_b = ArrayType(b)
+
     # Compute conjugate gradient algorithm
-    cg!(u, b, (y, x)->fd!(y, x, Δ), tol)
+    _, iterations, total_time = cg!(d_u, d_b, (y, x)->fd!(y, x, Δ), tol)
+
+    # Copy the solution back from the device
+    u .= d_u
 
     # fill in the boundary data
     u[  1,   :,   :] = uex[  1,   :,   :]
@@ -179,10 +216,27 @@ let
 
     # check the error
     err[k] = √prod(Δ) * norm(u - uex)
+
+    if k > 1
+      rate[k-1] = log2(err[k-1]./ err[k])
+      @info @sprintf """
+      mesh size (%d, %d, %d)
+        error              = %e
+        rate               = %e
+        elapsed time       = %e s
+        time per iteration = %e s
+      """ N[1]  N[2]  N[3] err[k] rate[k-1] total_time total_time / iterations
+    else
+      @info @sprintf """
+      mesh size (%d, %d, %d)
+        error              = %e
+        elapsed time       = %e s
+        time per iteration = %e s
+      """ N[1]  N[2]  N[3] err[k] total_time total_time / iterations
+    end
   end
 
   # Since we use grid doubling this estimates the rate
-  rate = log2.(err[1:end-1]./ err[2:end])
 
   @show err
   @show rate
